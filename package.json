@@ -1,15 +1,31 @@
 {
   "name": "atividades-de-registro",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "Sistema automatizado para gerenciamento de atividades de registro de imóveis integrado ao Pipedrive",
   "main": "main_node.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node webhook.js",
+    "dev": "nodemon webhook.js",
+    "test": "node main_node.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "pipedrive",
+    "webhook",
+    "automation",
+    "real-estate", 
+    "registro-imoveis"
+  ],
+  "author": "Equipe de Desenvolvimento",
+  "license": "MIT",
   "dependencies": {
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
   }
 }

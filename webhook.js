@@ -1,283 +1,321 @@
-/**
- * Função chamada quando o webhook recebe uma requisição POST
- * Pipedrive envia notificações de mudanças de campos aqui
- */
-function doPost(e) {
-  logarInfo('=== WEBHOOK ACIONADO ===', {});
+const express = require('express');
+const {
+  CONFIG,
+  logger,
+  obterDetalhesNegocio,
+  verificarSeEstaFinalizado,
+  invalidarCacheDeal,
+  validarEProcessar,
+  processarAtividadeCondicional
+} = require('./main_node.js');
+
+const app = express();
+app.use(express.json());
+
+// === CONFIGURAÇÃO DE CACHE E RATE LIMITING ===
+const CACHE_CONFIG = {
+  TEMPO_CACHE_ATIVIDADES: 300,
+  TEMPO_DEBOUNCE: 60,
+  MAX_REQUISICOES_POR_MINUTO: 30,
+  TEMPO_CACHE_HASH: 120,
+  TEMPO_BLOQUEIO_ERRO: 180
+};
+
+// Cache em memória (em produção, use Redis)
+const memoryCache = new Map();
+
+// === ANTI-FLOOD ===
+function calcularHashPayload(dados) {
+  try {
+    const dealId = extrairDealId(dados);
+    const timestampArredondado = Math.floor(Date.now() / 10000);
+    return `${dealId}_${timestampArredondado}`;
+  } catch (e) {
+    return Date.now().toString();
+  }
+}
+
+function verificarPayloadDuplicado(hash) {
+  const chave = `payload_hash_${hash}`;
+  if (memoryCache.has(chave)) return true;
+  
+  memoryCache.set(chave, 'processado');
+  setTimeout(() => memoryCache.delete(chave), CACHE_CONFIG.TEMPO_CACHE_HASH * 1000);
+  return false;
+}
+
+function verificarDebounce(dealId) {
+  const chave = `debounce_${dealId}`;
+  const ultimo = memoryCache.get(chave);
+  
+  if (ultimo) {
+    const tempoDecorrido = (Date.now() - ultimo) / 1000;
+    if (tempoDecorrido < CACHE_CONFIG.TEMPO_DEBOUNCE) return false;
+  }
+  
+  memoryCache.set(chave, Date.now());
+  setTimeout(() => memoryCache.delete(chave), (CACHE_CONFIG.TEMPO_DEBOUNCE + 10) * 1000);
+  return true;
+}
+
+function verificarRateLimit() {
+  const chave = 'rate_limit_count';
+  const chaveTimestamp = 'rate_limit_timestamp';
+  
+  const agora = Date.now();
+  const timestamp = memoryCache.get(chaveTimestamp);
+  
+  if (!timestamp || (agora - timestamp) > 60000) {
+    memoryCache.set(chaveTimestamp, agora);
+    memoryCache.set(chave, 1);
+    setTimeout(() => {
+      memoryCache.delete(chaveTimestamp);
+      memoryCache.delete(chave);
+    }, 60000);
+    return true;
+  }
+  
+  const count = memoryCache.get(chave) || 0;
+  
+  if (count >= CACHE_CONFIG.MAX_REQUISICOES_POR_MINUTO) return false;
+  
+  memoryCache.set(chave, count + 1);
+  return true;
+}
+
+function extrairDealId(dados) {
+  let dealId = null;
+  
+  if (dados.data?.id) dealId = dados.data.id;
+  else if (dados.current?.id) dealId = dados.current.id;
+  else if (dados.meta?.entity_id) dealId = dados.meta.entity_id;
+  else if (dados.deal?.id) dealId = dados.deal.id;
+  else if (dados.object?.id) dealId = dados.object.id;
+  
+  return dealId ? (typeof dealId === 'string' ? parseInt(dealId) : dealId) : null;
+}
+
+// === WEBHOOK HANDLER ===
+app.post('/webhook', async (req, res) => {
+  let dealId = null;
   
   try {
-    const conteudo = e.postData.contents;
-    const dados = JSON.parse(conteudo);
+    const dados = req.body;
+    dealId = extrairDealId(dados);
     
-    logarInfo('Payload recebido do webhook', dados);
+    if (!dealId) {
+      return responderErro(res, 'DealID não encontrado', 400);
+    }
     
-    // Validar estrutura do payload
+    // Anti-flood
+    const hashPayload = calcularHashPayload(dados);
+    if (verificarPayloadDuplicado(hashPayload)) {
+      return responderSucesso(res, 'Duplicado');
+    }
+    
+    // Debounce
+    if (!verificarDebounce(dealId)) {
+      return responderSucesso(res, 'Debounce ativo');
+    }
+    
+    // Rate limit
+    if (!verificarRateLimit()) {
+      return responderErro(res, 'Rate limit excedido', 429);
+    }
+    
+    // Validação
     if (!validarPayload(dados)) {
-      return responderErro('Payload inválido', 400);
+      registrarErroWebhook(dealId, 'Payload inválido', '', JSON.stringify(dados));
+      return responderErro(res, 'Payload inválido', 400);
     }
-    
-    // Extrair informações do evento
-    const evento = dados.event;
-    const dealId = dados.deal?.id || dados.object?.id;
-    const objeto = dados.object;
-    
-    logarInfo('Evento capturado', {
-      tipo: evento,
-      dealId,
-      objeto
-    });
-    
-    // Verificar se está finalizado (não criar atividades)
-    if (verificarSeEstaFinalizado(dealId)) {
-      logarInfo('Status é "Finalizado". Nenhuma atividade será criada.', { dealId });
-      return responderSucesso('Registro finalizado - sem ações');
+
+    const negocio = await obterDetalhesNegocio(dealId);
+    if (!negocio) {
+      registrarErroWebhook(dealId, 'Negócio não encontrado na API', '', '');
+      return responderErro(res, 'Negócio não encontrado', 404);
     }
+
+    const dealTitle = negocio.title || 'Sem título';
+
+    // Verifica se finalizado
+    if (await verificarSeEstaFinalizado(dealId, negocio)) {
+      const chaveLogFinalizado = `log_finalizado_${dealId}`;
+      if (!memoryCache.has(chaveLogFinalizado)) {
+        registrarLogWebhook(dealId, dealTitle, 'Finalizado - sem ações', [], 'Status = Finalizado');
+        memoryCache.set(chaveLogFinalizado, 'logged');
+        setTimeout(() => memoryCache.delete(chaveLogFinalizado), 86400000); // 24h
+      }
+      return responderSucesso(res, 'Finalizado');
+    }
+
+    const tipoEvento = dados.meta?.action || dados.event;
     
-    // Processar eventos
-    switch (evento) {
-      case 'updated.deal.field':
-        return tratarAtualizacaoCampo(dealId, objeto);
-      
+    switch (tipoEvento) {
+      case 'updated':
+      case 'change':
+      case 'updated.deal':
+        return await tratarAtualizacaoDeal(res, dealId, dados, negocio, dealTitle);
+      case 'added':
       case 'added.deal':
-        logarInfo('Novo negócio adicionado (sem ação)', { dealId });
-        break;
-      
+        registrarLogWebhook(dealId, dealTitle, 'Negócio adicionado', [], 'Deal criado');
+        return responderSucesso(res, 'OK');
       default:
-        logarInfo(`Evento não monitorado: ${evento}`, {});
-    }
-    
-    return responderSucesso('Webhook processado');
-    
-  } catch (erro) {
-    logarErro('Erro ao processar webhook', erro);
-    return responderErro(`Erro ao processar: ${erro.message}`, 500);
-  }
-}
-
-/**
- * Valida a estrutura básica do payload
- */
-function validarPayload(dados) {
-  return dados && 
-         dados.event && 
-         (dados.deal?.id || dados.object?.id);
-}
-
-/**
- * Verifica se o negócio está com status "Finalizado"
- */
-function verificarSeEstaFinalizado(dealId) {
-  try {
-    const negocio = chamarAPI(`/deals/${dealId}`, 'GET');
-    if (negocio?.success && negocio.data) {
-      const statusRegistro = negocio.data[CONFIG.CAMPO_STATUS_REGISTRO];
-      return statusRegistro === 'Finalizado';
+        return responderSucesso(res, 'OK');
     }
   } catch (erro) {
-    logarErro('Erro ao verificar status finalizado', erro);
+    logger.erro('Erro ao processar webhook:', erro);
+    registrarErroWebhook(dealId, erro.message, erro.stack || '', '');
+    return responderErro(res, `Erro: ${erro.message}`, 500);
   }
-  return false;
+});
+
+function validarPayload(d) { 
+  const temEvento = d && (d.event || d.meta);
+  const temDeal = d && (d.data || d.current || d.meta?.entity_id || d.deal || d.object);
+  return temEvento && temDeal;
 }
 
-/**
- * Trata atualização de campos específicos
- */
-function tratarAtualizacaoCampo(dealId, objeto) {
-  const idCampo = objeto?.field_key;
-  const valorCampo = objeto?.value;
+async function tratarAtualizacaoDeal(res, dealId, dados, negocioCacheado, dealTitle) {
+  const previous = dados.previous || {};
+  const current = dados.data || dados.current || {};
+  const camposAlterados = [];
   
-  logarInfo('Campo atualizado', {
+  if (previous.custom_fields && current.custom_fields) {
+    const prevFields = previous.custom_fields || {};
+    const currFields = current.custom_fields || {};
+    
+    const camposGatilho = [
+      CONFIG.CAMPO_STATUS_REGISTRO,
+      CONFIG.CAMPO_DATA_INICIO_REGISTRO,
+      CONFIG.CAMPO_DATA_TERMINO_CONTRATOS,
+      CONFIG.CAMPO_DATA_TERMINO_ITBI
+    ];
+    
+    camposGatilho.forEach(campo => {
+      const valorAnterior = prevFields[campo];
+      const valorAtual = currFields[campo];
+      if (JSON.stringify(valorAnterior) !== JSON.stringify(valorAtual)) {
+        camposAlterados.push({ campo, anterior: valorAnterior, atual: valorAtual });
+      }
+    });
+  }
+  
+  if (camposAlterados.length > 0) {
+    invalidarCacheDeal(dealId);
+    const resultado = await validarEProcessar(dealId, negocioCacheado);
+    
+    if (resultado.sucesso) {
+      const atividadesFormatadas = formatarAtividadesCriadas(resultado.atividadesCriadas);
+      registrarLogWebhook(dealId, dealTitle, 'Processamento incremental', atividadesFormatadas, `${resultado.atividadesCriadas.length} criada(s)`);
+      return responderSucesso(res, resultado.mensagem);
+    } else {
+      const chaveErro = `ultimo_erro_${dealId}`;
+      const ultimoErro = memoryCache.get(chaveErro);
+      
+      if (ultimoErro !== resultado.mensagem) {
+        registrarLogWebhook(dealId, dealTitle, 'Requisitos não atendidos', [], resultado.mensagem);
+        memoryCache.set(chaveErro, resultado.mensagem);
+        setTimeout(() => memoryCache.delete(chaveErro), CACHE_CONFIG.TEMPO_BLOQUEIO_ERRO * 1000);
+      }
+      
+      return responderSucesso(res, `Aguardando: ${resultado.mensagem}`);
+    }
+  }
+  
+  return responderSucesso(res, 'Sem alterações relevantes');
+}
+
+// === RESPOSTAS HTTP ===
+function responderSucesso(res, msg) {
+  const resposta = {
+    sucesso: true, 
+    mensagem: msg, 
+    timestamp: new Date().toLocaleString('pt-BR')
+  };
+  res.json(resposta);
+}
+
+function responderErro(res, msg, status = 400) {
+  const resposta = {
+    sucesso: false, 
+    mensagem: msg, 
+    codigoStatus: status, 
+    timestamp: new Date().toLocaleString('pt-BR')
+  };
+  res.status(status).json(resposta);
+}
+
+// === SISTEMA DE LOGS ===
+// Em ambiente Node.js, você pode implementar logs em arquivo ou banco de dados
+// Por simplicidade, vamos usar console.log com estrutura organizada
+
+function registrarLogWebhook(dealId, title, action, atividadesCriadas = [], detalhes = '') {
+  const timestamp = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  const atividadesTexto = atividadesCriadas.length > 0 
+    ? atividadesCriadas.map(a => `✓ ${a}`).join('\n')
+    : 'Nenhuma';
+  
+  logger.info('WEBHOOK LOG', {
+    timestamp,
     dealId,
-    campo: idCampo,
-    valor: valorCampo
+    title: title || 'N/A',
+    action,
+    atividades: atividadesTexto,
+    detalhes
   });
   
-  // Campo: Data Término Contratos
-  if (idCampo === CONFIG.CAMPO_DATA_CONTRATOS) {
-    return procesarDataContratosOuITBI(dealId, 'contratos');
-  }
-  
-  // Campo: Data Término ITBI
-  if (idCampo === CONFIG.CAMPO_DATA_ITBI) {
-    return procesarDataContratosOuITBI(dealId, 'itbi');
-  }
-  
-  // Campo: Status Registro - Nota Devolutiva
-  if (idCampo === CONFIG.CAMPO_STATUS_REGISTRO) {
-    if (valorCampo === '06. Atendendo Nota Devolutiva') {
-      processarAtividadeCondicional(dealId, 'NOTA_DEVOLUTIVA', null);
-      return responderSucesso('Atividade de Nota Devolutiva criada');
-    }
-  }
-  
-  // Campo: Data Vencimento Protocolo Registro
-  if (idCampo === CONFIG.CAMPO_DATA_VENCIMENTO) {
-    if (valorCampo) {
-      processarAtividadeCondicional(dealId, 'VENCIMENTO_PRENOTACAO', valorCampo);
-      return responderSucesso('Atividade de Vencimento da Prenotação criada');
-    }
-  }
-  
-  return responderSucesso('Campo monitorado mas sem ação específica');
+  // Em produção, você pode salvar em banco de dados ou arquivo
+  // Exemplo: await salvarLogBanco({ timestamp, dealId, title, action, atividades, detalhes });
 }
 
-/**
- * Processa atualização dos campos de Data Contratos ou ITBI
- * Cria atividades escala apenas quando AMBOS estão preenchidos
- */
-function procesarDataContratosOuITBI(dealId, tipo) {
-  logarInfo(`Processando Data ${tipo.toUpperCase()}`, { dealId });
+function registrarErroWebhook(dealId, erro, stackTrace = '', payload = '') {
+  const timestamp = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
   
-  const negocio = obterDetalhesNegocio(dealId);
-  if (!negocio) {
-    return responderErro('Negócio não encontrado', 404);
-  }
-  
-  const dataContratos = negocio[CONFIG.CAMPO_DATA_CONTRATOS];
-  const dataITBI = negocio[CONFIG.CAMPO_DATA_ITBI];
-  
-  logarInfo('Verificando preenchimento de campos', {
-    dataContratos: dataContratos || 'vazio',
-    dataITBI: dataITBI || 'vazio'
+  logger.erro('WEBHOOK ERROR', {
+    timestamp,
+    dealId: dealId || 'N/A',
+    erro,
+    stackTrace,
+    payload: payload.length > 1000 ? payload.substring(0, 1000) + '...[truncado]' : payload
   });
   
-  // Ambos campos preenchidos - criar atividades
-  if (dataContratos && dataITBI) {
-    // Usar a data mais recente como data de início
-    const data1 = new Date(dataContratos);
-    const data2 = new Date(dataITBI);
-    const dataInicio = data1 > data2 ? data1 : data2;
-    
-    logarInfo('✓ Ambos campos preenchidos. Criando atividades escala.', {
-      dealId,
-      dataInicio: formatarDataISO(dataInicio)
-    });
-    
-    // Verificar se atividades já foram criadas (evitar duplicatas)
-    if (!verificarAtividadesJaCriadas(dealId)) {
-      processarAtividadesEscala(dealId, dataInicio);
-      return responderSucesso('Atividades escala criadas com sucesso');
-    } else {
-      logarInfo('Atividades já foram criadas para este negócio', { dealId });
-      return responderSucesso('Atividades já existentes - sem ações');
-    }
-  } else {
-    logarInfo('Campos ainda não estão ambos preenchidos', {
-      dealId,
-      tipo,
-      statusContratos: dataContratos ? 'preenchido' : 'vazio',
-      statusITBI: dataITBI ? 'preenchido' : 'vazio'
-    });
-    return responderSucesso('Aguardando preenchimento de ambos campos');
-  }
+  // Em produção, você pode salvar em banco de dados ou arquivo
+  // Exemplo: await salvarErroBanco({ timestamp, dealId, erro, stackTrace, payload });
 }
 
-/**
- * Verifica se as atividades de escala já foram criadas
- * para evitar duplicatas
- */
-function verificarAtividadesJaCriadas(dealId) {
+function formatarAtividadesCriadas(atividades) {
+  if (!atividades || atividades.length === 0) return [];
+  return atividades.map(titulo => {
+    const match = titulo.match(/REGISTRO - (\d+) DIA/);
+    return match ? `DIA ${match[1]}` : titulo;
+  });
+}
+
+// === ROTAS ADICIONAIS ===
+app.get('/status', (req, res) => {
+  res.json({
+    status: 'ativo',
+    timestamp: new Date().toLocaleString('pt-BR'),
+    versao: '2.0.0'
+  });
+});
+
+app.get('/test/:dealId', async (req, res) => {
   try {
-    const resultado = chamarAPI(`/deals/${dealId}/activities`, 'GET');
-    if (resultado?.success && resultado.data) {
-      const atividades = resultado.data;
-      // Verificar se existe atividade de "1 DIA - INICIAR"
-      return atividades.some(a => 
-        a.subject && a.subject.includes('1 DIA - INICIAR')
-      );
-    }
+    const dealId = parseInt(req.params.dealId);
+    const { testarNegocio } = require('./main_node.js');
+    const resultado = await testarNegocio(dealId);
+    res.json(resultado);
   } catch (erro) {
-    logarErro('Erro ao verificar atividades criadas', erro);
+    logger.erro('Erro no teste:', erro);
+    res.status(500).json({ erro: erro.message });
   }
-  return false;
-}
+});
 
-/**
- * Formata resposta de sucesso do webhook
- */
-function responderSucesso(mensagem) {
-  const resposta = {
-    sucesso: true,
-    mensagem: mensagem,
-    timestamp: new Date().toLocaleString('pt-BR')
-  };
-  logarInfo(mensagem, resposta);
-  return ContentService.createTextOutput(JSON.stringify(resposta))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-/**
- * Formata resposta de erro do webhook
- */
-function responderErro(mensagem, codigoStatus = 400) {
-  const resposta = {
-    sucesso: false,
-    mensagem: mensagem,
-    codigoStatus: codigoStatus,
-    timestamp: new Date().toLocaleString('pt-BR')
-  };
-  logarErro(mensagem, resposta);
-  return ContentService.createTextOutput(JSON.stringify(resposta))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-/**
- * Função para registrar o webhook no Pipedrive
- * Execute esta função uma única vez para configurar
- */
-function registrarWebhookNoPipedrive() {
-  logarInfo('=== REGISTRANDO WEBHOOK ===', {});
-  
-  // Obter URL do script (usar URL de deploy)
-  const scriptId = ScriptApp.getScriptId();
-  const urlWebhook = `https://script.google.com/macros/d/${scriptId}/usercontent`;
-  
-  logarInfo('URL do webhook', { url: urlWebhook });
-  
-  // Eventos que queremos monitorar
-  const eventos = [
-    'updated.deal.field',  // Quando campo é atualizado
-    'added.deal'           // Quando negócio é criado
-  ];
-  
-  eventos.forEach(evento => {
-    const payload = {
-      subscription_url: urlWebhook,
-      event_action: evento,
-      event_object: 'deal'
-    };
-    
-    const resultado = chamarAPI('/webhooks', 'POST', payload);
-    
-    if (resultado?.success) {
-      logarInfo(`✓ Webhook registrado para evento: ${evento}`, {
-        webhookId: resultado.data?.id
-      });
-    } else {
-      logarErro(`Erro ao registrar webhook para ${evento}`, resultado);
-    }
-  });
-  
-  logarInfo('=== REGISTRO DE WEBHOOK FINALIZADO ===', {});
-}
-
-/**
- * Função para listar webhooks cadastrados
- * Use para verificar quais webhooks estão ativos
- */
-function listarWebhooks() {
-  logarInfo('=== LISTANDO WEBHOOKS ===', {});
-  const resultado = chamarAPI('/webhooks', 'GET');
-  
-  if (resultado?.success && resultado.data) {
-    console.log('Webhooks ativos:', JSON.stringify(resultado.data, null, 2));
-  } else {
-    console.log('Nenhum webhook encontrado ou erro na consulta');
-  }
-}
-
-// INSTRUÇÕES DE USO:
-// 1. Execute testarNegocio(10931) para validar configurações
-// 2. Deploy este script como Web App (Deploy > New Deployment > Web app)
-// 3. Execute registrarWebhookNoPipedrive() para ativar o webhook
-// 4. Use listarWebhooks() para confirmar a configuração
+// Iniciar servidor
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(`🚀 Servidor webhook iniciado na porta ${PORT}`);
+  logger.info(`📍 Endpoint: http://localhost:${PORT}/webhook`);
+  logger.info(`🔍 Status: http://localhost:${PORT}/status`);
+});
